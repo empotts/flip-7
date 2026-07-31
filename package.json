@@ -1,0 +1,32 @@
+{
+  "name": "flip-seven",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.14.0",
+  "type": "module",
+  "scripts": {
+    "dev": "alchemy dev",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "deploy": "alchemy deploy",
+    "destroy": "alchemy destroy"
+  },
+  "dependencies": {
+    "@tanstack/react-router": "^1.168.34",
+    "@tanstack/react-start": "^1.168.34",
+    "alchemy": "2.0.0-beta.66",
+    "effect": "4.0.0-beta.102",
+    "lucide-react": "^0.548.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260731.1",
+    "@effect/platform-node": "4.0.0-beta.102",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.0"
+  }
+}
