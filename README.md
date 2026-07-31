@@ -2,7 +2,7 @@
 
 A realtime, mobile-first push-your-luck card game inspired by Flip 7. Create a table, share its link, and race friends to 200 points without flipping the same number twice.
 
-**Live game:** [Play Lucky Seven](https://flipseven-flipseven-dev-ethanpotts-rglfh4ctd6kj2lxs.ethanmpotts.workers.dev)
+**Live game:** [Play Lucky Seven](https://flipseven-flipseven-dev-ethanpotts-rr2xoild6whe44tl.ethanmpotts.workers.dev)
 
 ## Stack
 
