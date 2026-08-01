@@ -13,7 +13,7 @@ type LocalPlayer = {
 };
 
 type ScoredRound = { id: string; scores: Record<string, number> };
-type SavedScoreboard = { players: LocalPlayer[]; rounds: ScoredRound[] };
+type SavedScoreboard = { players: LocalPlayer[]; rounds: ScoredRound[]; pointGoal?: number };
 
 const storageKey = "lucky-seven:local-scoreboard";
 
@@ -21,6 +21,7 @@ function Scorekeeper() {
   const [players, setPlayers] = useState<LocalPlayer[]>([]);
   const [rounds, setRounds] = useState<ScoredRound[]>([]);
   const [name, setName] = useState("");
+  const [pointGoal, setPointGoal] = useState(200);
   const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
@@ -30,6 +31,7 @@ function Scorekeeper() {
         const saved = JSON.parse(raw) as SavedScoreboard;
         setPlayers(saved.players ?? []);
         setRounds(saved.rounds ?? []);
+        setPointGoal(saved.pointGoal ?? 200);
       } catch {
         localStorage.removeItem(storageKey);
       }
@@ -38,8 +40,8 @@ function Scorekeeper() {
   }, []);
 
   useEffect(() => {
-    if (hydrated) localStorage.setItem(storageKey, JSON.stringify({ players, rounds }));
-  }, [hydrated, players, rounds]);
+    if (hydrated) localStorage.setItem(storageKey, JSON.stringify({ players, rounds, pointGoal }));
+  }, [hydrated, players, pointGoal, rounds]);
 
   const leaderId = useMemo(() => {
     if (players.length === 0) return null;
@@ -86,8 +88,13 @@ function Scorekeeper() {
   };
 
   const reset = () => {
-    if (!window.confirm("Clear every player and score from this device?")) return;
-    setPlayers([]);
+    if (!window.confirm("Start a new game with the same players? All scores and rounds will reset.")) return;
+    setPlayers((current) => current.map((player) => ({
+      ...player,
+      total: 0,
+      roundScore: "",
+      busted: false,
+    })));
     setRounds([]);
   };
 
@@ -96,11 +103,11 @@ function Scorekeeper() {
       <header className="scorekeeper-header">
         <Link className="icon-button" to="/" aria-label="Back home"><ArrowLeft size={20} /></Link>
         <div className="game-brand score-brand"><span className="brand-mark">7</span><div><b>TABLE SCORE</b><small>LOCAL GAME</small></div></div>
-        <button className="icon-button" onClick={reset} aria-label="Reset scoreboard"><RotateCcw size={18} /></button>
+        <button className="icon-button" onClick={reset} aria-label="New game with the same players" title="New game with the same players"><RotateCcw size={18} /></button>
       </header>
 
       <section className="scorekeeper-hero">
-        <p className="eyebrow"><Trophy size={15} /> First to 200</p>
+        <p className="eyebrow"><Trophy size={15} /> First to {pointGoal}</p>
         <h1>Pass the phone.<br /><em>Count the glory.</em></h1>
         <p>For a game happening around your table. Scores stay on this device.</p>
       </section>
@@ -108,6 +115,7 @@ function Scorekeeper() {
       <section className="score-sheet">
         <div className="score-sheet-top">
           <div><span>ROUND</span><strong>{rounds.length + 1}</strong></div>
+          <label className="local-goal-input"><span>POINT GOAL</span><input type="number" min="1" max="9999" inputMode="numeric" value={pointGoal} onChange={(event) => setPointGoal(Number(event.target.value))} onBlur={() => setPointGoal(Math.max(1, Math.min(9999, pointGoal || 200)))} /></label>
           {rounds.length > 0 && <button className="text-button" onClick={undoRound}><Undo2 size={15} /> Undo last round</button>}
         </div>
 
@@ -123,7 +131,7 @@ function Scorekeeper() {
             <article className={`local-player ${player.busted ? "did-bust" : ""}`} key={player.id}>
               <div className="local-player-name">
                 <span className="avatar">{initials(player.name)}</span>
-                <span><b>{player.name} {leaderId === player.id && <Crown size={14} />}</b><small>{player.total >= 200 ? "Over 200!" : `${200 - player.total} to win`}</small></span>
+                <span><b>{player.name} {leaderId === player.id && <Crown size={14} />}</b><small>{player.total >= pointGoal ? `Reached ${pointGoal}!` : `${pointGoal - player.total} to win`}</small></span>
               </div>
               <div className="local-total"><strong>{player.total}</strong><small>TOTAL</small></div>
               <label className="round-score-input">

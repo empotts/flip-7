@@ -1,6 +1,7 @@
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
 import { ArrowRight, Calculator, Copy, Layers3, Sparkles, Users } from "lucide-react";
 import { FormEvent, useState } from "react";
+import type { GameMode } from "../types";
 
 export const Route = createFileRoute("/")({ component: Home });
 
@@ -11,6 +12,8 @@ function Home() {
   const [mode, setMode] = useState<"create" | "join">("create");
   const [name, setName] = useState("");
   const [code, setCode] = useState("");
+  const [gameMode, setGameMode] = useState<GameMode>("classic");
+  const [pointGoal, setPointGoal] = useState(200);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -24,7 +27,7 @@ function Home() {
       const response = await fetch(endpoint, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify(mode === "create" ? { name, mode: gameMode, pointGoal } : { name }),
       });
       const data = (await response.json()) as SessionResponse;
       if (!response.ok) throw new Error(data.error || "Could not reach the table.");
@@ -104,6 +107,26 @@ function Home() {
                   required
                 />
               </label>
+            )}
+
+            {mode === "create" && (
+              <div className="game-options">
+                <fieldset>
+                  <legend>Game mode</legend>
+                  <label className={`option-card ${gameMode === "classic" ? "selected" : ""}`}>
+                    <input type="radio" name="game-mode" checked={gameMode === "classic"} onChange={() => setGameMode("classic")} />
+                    <span><b>Classic</b><small>The original 94-card game</small></span>
+                  </label>
+                  <label className={`option-card ${gameMode === "vengeance" ? "selected" : ""}`}>
+                    <input type="radio" name="game-mode" checked={gameMode === "vengeance"} onChange={() => setGameMode("vengeance")} />
+                    <span><b>With a Vengeance</b><small>Special numbers, take-that cards, and negative modifiers</small></span>
+                  </label>
+                </fieldset>
+                <label>
+                  Point goal
+                  <input type="number" inputMode="numeric" min="1" max="9999" value={pointGoal} onChange={(event) => setPointGoal(Number(event.target.value))} required />
+                </label>
+              </div>
             )}
 
             {error && <p className="form-error" role="alert">{error}</p>}

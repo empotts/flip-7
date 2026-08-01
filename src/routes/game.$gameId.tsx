@@ -107,7 +107,9 @@ function GamePage() {
   const me = game.players.find((player) => player.id === session.playerId)!;
   const isMyTurn = game.currentPlayerId === me.id;
   const isChoosingTarget = game.pendingActionPlayerId === me.id && !!game.pendingAction;
+  const isChoosingCard = isChoosingTarget && ["steal", "swap", "discard"].includes(game.pendingAction ?? "");
   const canStart = me.isHost && ["lobby", "round-over"].includes(game.phase);
+  const canRestart = me.isHost && game.phase === "game-over";
   const activePlayer = game.players.find((player) => player.id === game.currentPlayerId);
 
   return (
@@ -136,6 +138,7 @@ function GamePage() {
         <div>
           <span className="round-label">{game.phase === "lobby" ? "WAITING ROOM" : `ROUND ${game.round}`}</span>
           <p>{game.message}</p>
+          <div className="game-rules"><span>{game.mode === "vengeance" ? "WITH A VENGEANCE" : "CLASSIC"}</span><span>FIRST TO {game.pointGoal}</span></div>
         </div>
         <div className="deck-counter" title="Cards remaining in deck">
           <span className="mini-deck"><i /><i /><b>7</b></span>
@@ -150,9 +153,7 @@ function GamePage() {
           <div className="panel-heading"><span>TABLE</span><small>{game.players.length}/8 players</small></div>
           <div className="players-scroll">
             {game.players.map((player) => {
-              const targetable = isChoosingTarget && player.status === "active" && (
-                game.pendingAction !== "secondChance" || (player.id !== me.id && !player.hasSecondChance)
-              );
+              const targetable = isChoosingTarget && !isChoosingCard && isEligiblePlayerTarget(game, me, player);
               return (
                 <button
                   key={player.id}
@@ -180,7 +181,7 @@ function GamePage() {
             <>
               <div className="turn-banner">
                 {isChoosingTarget ? (
-                  <><Sparkles size={18} /> Choose {game.pendingAction === "secondChance" ? "another player for" : "any active player for"} <b>{actionName(game.pendingAction)}</b></>
+                  <><Sparkles size={18} /> {isChoosingCard ? "Choose a face-up card for" : "Choose a player for"} <b>{actionName(game.pendingAction)}</b></>
                 ) : isMyTurn && game.phase === "playing" ? (
                   <><span className="pulse-dot" /> Your turn — flip or stay?</>
                 ) : game.phase === "playing" ? (
@@ -194,7 +195,14 @@ function GamePage() {
 
               <div className="hands-list">
                 {game.players.map((player) => (
-                  <PlayerHand key={player.id} player={player} isMe={player.id === me.id} />
+                  <PlayerHand
+                    key={player.id}
+                    player={player}
+                    isMe={player.id === me.id}
+                    game={game}
+                    chooser={me}
+                    onSelectCard={(cardId) => send({ type: "selectCard", playerId: player.id, cardId })}
+                  />
                 ))}
               </div>
             </>
@@ -205,16 +213,20 @@ function GamePage() {
       <footer className="action-bar">
         <div className="action-context">
           <span>{me.name}</span>
-          <b>{me.status === "active" ? `${handScore(me.cards)} on the table` : playerStatus(me, game)}</b>
+          <b>{me.status === "active" ? `${handScore(me.cards, game.mode)} on the table` : playerStatus(me, game)}</b>
         </div>
         <div className="action-buttons">
-          {canStart ? (
+          {canRestart ? (
+            <button className="button button-primary" onClick={() => send({ type: "restart" })}>
+              <RotateCw size={18} /> Play again
+            </button>
+          ) : canStart ? (
             <button className="button button-primary" onClick={() => send({ type: "start" })} disabled={game.phase === "lobby" && game.players.length < 2}>
               <Play size={18} fill="currentColor" /> {game.phase === "lobby" ? "Start game" : "Next round"}
             </button>
           ) : game.phase === "playing" ? (
             <>
-              <button className="button button-stay" disabled={!isMyTurn || isChoosingTarget || me.status !== "active" || me.cards.length === 0} onClick={() => send({ type: "stay" })}>
+              <button className="button button-stay" disabled={!isMyTurn || isChoosingTarget || me.status !== "active" || me.cards.length === 0 || hasZero(me.cards)} onClick={() => send({ type: "stay" })}>
                 <ShieldCheck size={19} /> Stay
               </button>
               <button className="button button-flip" disabled={!isMyTurn || isChoosingTarget || me.status !== "active"} onClick={() => send({ type: "hit" })}>
@@ -222,7 +234,7 @@ function GamePage() {
               </button>
             </>
           ) : (
-            <span className="waiting-host">{game.phase === "game-over" ? "Game complete" : "Waiting for the host…"}</span>
+            <span className="waiting-host">{game.phase === "game-over" ? "Waiting for the host to start a rematch…" : "Waiting for the host…"}</span>
           )}
         </div>
       </footer>
@@ -280,6 +292,7 @@ function LobbyView({ game, me, canStart, send, share }: { game: GameView; me: Pl
       <p className="eyebrow">THE TABLE IS OPEN</p>
       <h2>Waiting for players</h2>
       <p>Share the link with friends. The host can deal once at least two players are seated.</p>
+      <div className="lobby-rules"><span>{game.mode === "vengeance" ? "With a Vengeance" : "Classic mode"}</span><span>First to {game.pointGoal} points</span></div>
       <div className="game-code-block"><small>GAME CODE</small><strong>{game.id}</strong></div>
       <div className="lobby-actions">
         <button className="button button-ghost" onClick={share}><Copy size={17} /> Copy invite</button>
@@ -290,15 +303,48 @@ function LobbyView({ game, me, canStart, send, share }: { game: GameView; me: Pl
   );
 }
 
-function PlayerHand({ player, isMe }: { player: PlayerView; isMe: boolean }) {
+function PlayerHand({
+  player,
+  isMe,
+  game,
+  chooser,
+  onSelectCard,
+}: {
+  player: PlayerView;
+  isMe: boolean;
+  game: GameView;
+  chooser: PlayerView;
+  onSelectCard: (cardId: string) => void;
+}) {
+  const isChoosing = game.pendingActionPlayerId === chooser.id && ["steal", "swap", "discard"].includes(game.pendingAction ?? "");
+  const firstSelection = game.pendingCardSelections[0];
   return (
     <article className={`hand-row ${isMe ? "my-hand" : ""} ${player.status === "busted" ? "busted" : ""}`}>
       <div className="hand-meta">
         <div><span className="avatar small">{initials(player.name)}</span><b>{isMe ? "Your hand" : player.name}</b></div>
-        <span><b>{player.status === "busted" ? 0 : handScore(player.cards)}</b> round pts</span>
+        <span><b>{player.status === "busted" ? 0 : handScore(player.cards, game.mode)}</b> round pts</span>
       </div>
       <div className="cards-scroll">
-        {player.cards.length ? player.cards.map((card) => <CardTile key={card.id} card={card} />) : <span className="empty-hand">No cards yet</span>}
+        {player.cards.length ? player.cards.map((card) => {
+          const selected = firstSelection?.cardId === card.id;
+          const selectable = isChoosing && player.status !== "busted" && (
+            game.pendingAction === "discard" ||
+            (game.pendingAction === "steal" && player.id !== chooser.id) ||
+            (game.pendingAction === "swap" && (!firstSelection || firstSelection.playerId !== player.id))
+          );
+          return (
+            <button
+              type="button"
+              className={`card-choice ${selectable ? "selectable" : ""} ${selected ? "selected" : ""}`}
+              key={card.id}
+              disabled={!selectable}
+              onClick={() => onSelectCard(card.id)}
+              aria-label={`${selectable ? "Choose" : "Card"} ${cardLabel(card)} from ${player.name}`}
+            >
+              <CardTile card={card} />
+            </button>
+          );
+        }) : <span className="empty-hand">No cards yet</span>}
       </div>
       {player.status !== "active" && <span className={`hand-stamp ${player.status}`}>{player.status}</span>}
     </article>
@@ -306,22 +352,60 @@ function PlayerHand({ player, isMe }: { player: PlayerView; isMe: boolean }) {
 }
 
 function CardTile({ card }: { card: Card }) {
-  if (card.kind === "number") return <span className={`playing-card number-card n${card.value % 6}`}><small>7</small><strong>{card.value}</strong><small>{card.value}</small></span>;
+  if (card.kind === "number") return <span className={`playing-card number-card n${card.value % 6} ${card.special ? `special-${card.special}` : ""}`}><small>{card.special === "zero" ? "THE ZERO" : card.special === "unlucky7" ? "UNLUCKY" : card.special === "lucky13" ? "LUCKY" : "7"}</small><strong>{card.value}</strong><small>{card.special ? card.special.replace(/\d/, " ").toUpperCase() : card.value}</small></span>;
   if (card.kind === "bonus") return <span className="playing-card bonus-card"><small>BONUS</small><strong>+{card.value}</strong><small>PTS</small></span>;
   if (card.kind === "double") return <span className="playing-card double-card"><small>SCORE</small><strong>×2</strong><small>DOUBLE</small></span>;
+  if (card.kind === "modifier") return <span className="playing-card modifier-card"><small>PLAY ON</small><strong>{card.value === "half" ? "÷2" : card.value}</strong><small>ANY PLAYER</small></span>;
   if (card.kind === "secondChance") return <span className="playing-card chance-card"><small>SECOND</small><strong>↺</strong><small>CHANCE</small></span>;
-  return <span className="playing-card action-card"><small>ACTION</small><strong>{card.kind === "freeze" ? "❄" : "3×"}</strong><small>{card.kind === "freeze" ? "FREEZE" : "FLIP"}</small></span>;
+  return <span className="playing-card action-card"><small>ACTION</small><strong>{actionSymbol(card.kind)}</strong><small>{actionName(card.kind)}</small></span>;
 }
 
 const initials = (name: string) => name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
 
 const actionName = (action: GameView["pendingAction"]) =>
-  action === "freeze" ? "Freeze" : action === "flip3" ? "Flip Three" : "Second Chance";
+  action === "freeze" ? "Freeze" :
+    action === "flip3" ? "Flip Three" :
+      action === "secondChance" ? "Second Chance" :
+        action === "justOneMore" ? "Just One More" :
+          action === "flip4" ? "Flip Four" :
+            action === "steal" ? "Steal" :
+              action === "swap" ? "Swap" :
+                action === "discard" ? "Discard" : "Modifier";
 
-const handScore = (cards: Card[]) => {
+const handScore = (cards: Card[], mode: GameView["mode"]) => {
   const number = cards.reduce((sum, card) => sum + (card.kind === "number" ? card.value : 0), 0);
   const bonus = cards.reduce((sum, card) => sum + (card.kind === "bonus" ? card.value : 0), 0);
+  const flipSeven = cards.filter((card) => card.kind === "number").length >= 7 ? 15 : 0;
+  if (mode === "vengeance") {
+    const zero = cards.some((card) => card.kind === "number" && card.special === "zero");
+    const half = cards.some((card) => card.kind === "modifier" && card.value === "half");
+    const penalty = cards.reduce((sum, card) => sum + (card.kind === "modifier" && card.value !== "half" ? Math.abs(card.value) : 0), 0);
+    return Math.max(0, Math.floor((zero ? 0 : number) / (half ? 2 : 1)) - penalty) + flipSeven;
+  }
   return number * (cards.some((card) => card.kind === "double") ? 2 : 1) + bonus + (cards.filter((card) => card.kind === "number").length >= 7 ? 15 : 0);
+};
+
+const hasZero = (cards: Card[]) => cards.some((card) => card.kind === "number" && card.special === "zero");
+
+const actionSymbol = (action: Exclude<GameView["pendingAction"], "modifier" | null>) => ({
+  freeze: "❄",
+  flip3: "3×",
+  secondChance: "↺",
+  justOneMore: "+1",
+  flip4: "4×",
+  steal: "←",
+  swap: "⇄",
+  discard: "×",
+})[action];
+
+const cardLabel = (card: Card) => card.kind === "number" ? `${card.special ? `${card.special} ` : ""}${card.value}` : card.kind === "modifier" ? (card.value === "half" ? "divide by two" : `${card.value}`) : card.kind;
+
+const isEligiblePlayerTarget = (game: GameView, me: PlayerView, player: PlayerView) => {
+  if (!game.pendingAction) return false;
+  if (["freeze", "flip3"].includes(game.pendingAction)) return player.status === "active";
+  if (game.pendingAction === "secondChance") return player.status === "active" && player.id !== me.id && !player.hasSecondChance;
+  if (["modifier", "justOneMore", "flip4"].includes(game.pendingAction)) return player.status !== "busted";
+  return false;
 };
 
 const playerStatus = (player: PlayerView, game: GameView) => {

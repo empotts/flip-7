@@ -3,21 +3,33 @@ import type {
   ActionCard,
   Card,
   ClientMessage,
+  GameMode,
   GameView,
+  ModifierCard,
   PlayerView,
   ServerMessage,
 } from "./types";
 
 type Player = Omit<PlayerView, "connected"> & { token: string };
-type PendingAction = { kind: ActionCard["kind"]; ownerId: string; card: ActionCard };
+type PendingCard = ActionCard | ModifierCard;
+type CardSelection = { playerId: string; cardId: string };
+type PendingAction = {
+  kind: PendingCard["kind"];
+  ownerId: string;
+  card: PendingCard;
+  selections: CardSelection[];
+};
 type ForcedDraw = {
   targetId: string;
   remaining: number;
   deferredActions: PendingAction[];
+  stayAfter: boolean;
 };
 
 type StoredGame = {
   id: string;
+  mode: GameMode;
+  pointGoal: number;
   phase: GameView["phase"];
   players: Player[];
   deck: Card[];
@@ -34,7 +46,9 @@ type StoredGame = {
   message: string;
 };
 
-type LegacyGame = Omit<StoredGame, "discardPile" | "dealerIndex" | "actionQueue" | "forcedDraw" | "initialDealQueue" | "resumeFlow" | "pendingAction"> & {
+type LegacyGame = Omit<StoredGame, "mode" | "pointGoal" | "discardPile" | "dealerIndex" | "actionQueue" | "forcedDraw" | "initialDealQueue" | "resumeFlow" | "pendingAction"> & {
+  mode?: GameMode;
+  pointGoal?: number;
   discardPile?: Card[];
   dealerIndex?: number;
   actionQueue?: PendingAction[];
@@ -62,6 +76,11 @@ const cleanName = (value: unknown) =>
     .trim()
     .slice(0, 20);
 
+const cleanPointGoal = (value: unknown) => {
+  const goal = Number(value ?? 200);
+  return Number.isInteger(goal) && goal >= 1 && goal <= 9999 ? goal : null;
+};
+
 const gameCode = () => {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const bytes = crypto.getRandomValues(new Uint8Array(5));
@@ -77,13 +96,20 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/games") {
-      const body = (await request.json().catch(() => ({}))) as { name?: string };
+      const body = (await request.json().catch(() => ({}))) as {
+        name?: string;
+        mode?: GameMode;
+        pointGoal?: number;
+      };
       const name = cleanName(body.name);
       if (!name) return json({ error: "Enter a name to create a game." }, { status: 400 });
+      const mode = body.mode === "vengeance" ? "vengeance" : "classic";
+      const pointGoal = cleanPointGoal(body.pointGoal);
+      if (!pointGoal) return json({ error: "Choose a point goal from 1 to 9,999." }, { status: 400 });
 
       const id = gameCode();
       const room = env.GAMES.getByName(id);
-      const player = await room.createGame(id, name);
+      const player = await room.createGame(id, name, mode, pointGoal);
       return json({ gameId: id, ...player }, { status: 201 });
     }
 
@@ -123,25 +149,34 @@ export class GameRoom extends DurableObject<WorkerEnv> {
       if (!stored) return;
       this.game = {
         ...stored,
+        mode: stored.mode ?? "classic",
+        pointGoal: stored.pointGoal ?? 200,
         discardPile: stored.discardPile ?? [],
         dealerIndex: stored.dealerIndex ?? Math.max(0, stored.round - 1) % stored.players.length,
         pendingAction:
           stored.pendingAction && typeof stored.pendingAction === "object"
-            ? stored.pendingAction
+            ? { ...stored.pendingAction, selections: stored.pendingAction.selections ?? [] }
             : null,
-        actionQueue: stored.actionQueue ?? [],
-        forcedDraw: stored.forcedDraw ?? null,
+        actionQueue: (stored.actionQueue ?? []).map((action) => ({
+          ...action,
+          selections: action.selections ?? [],
+        })),
+        forcedDraw: stored.forcedDraw
+          ? { ...stored.forcedDraw, stayAfter: stored.forcedDraw.stayAfter ?? false }
+          : null,
         initialDealQueue: stored.initialDealQueue ?? [],
         resumeFlow: stored.resumeFlow ?? null,
       };
     });
   }
 
-  async createGame(id: string, name: string) {
+  async createGame(id: string, name: string, mode: GameMode, pointGoal: number) {
     if (this.game) throw new Error("Game already exists");
     const player = this.newPlayer(name, true);
     this.game = {
       id,
+      mode,
+      pointGoal,
       phase: "lobby",
       players: [player],
       deck: [],
@@ -244,10 +279,22 @@ export class GameRoom extends DurableObject<WorkerEnv> {
       return;
     }
 
+    if (move.type === "restart") {
+      if (!player.isHost) throw new Error("Only the host can start a rematch.");
+      if (game.phase !== "game-over") throw new Error("Finish this game before starting a rematch.");
+      this.restartGame();
+      return;
+    }
+
     if (game.phase !== "playing") throw new Error("Wait for the host to start the round.");
 
     if (move.type === "target") {
       this.assignPendingAction(playerId, move.targetId);
+      return;
+    }
+
+    if (move.type === "selectCard") {
+      this.selectPendingCard(playerId, move.playerId, move.cardId);
       return;
     }
 
@@ -264,6 +311,7 @@ export class GameRoom extends DurableObject<WorkerEnv> {
 
     if (move.type === "stay") {
       if (player.cards.length === 0) throw new Error("You need at least one card before you can stay.");
+      if (this.hasSpecial(player, "zero")) throw new Error("The Zero forces you to keep flipping.");
       player.status = "stayed";
       player.roundScore = this.score(player.cards);
       game.message = `${player.name} stayed on ${player.roundScore}.`;
@@ -272,11 +320,27 @@ export class GameRoom extends DurableObject<WorkerEnv> {
     }
   }
 
+  private restartGame() {
+    const game = this.requiredGame();
+    game.deck = [];
+    game.discardPile = [];
+    game.dealerIndex = 0;
+    game.round = 0;
+    for (const player of game.players) {
+      player.cards = [];
+      player.score = 0;
+      player.roundScore = 0;
+      player.status = "active";
+      player.hasSecondChance = false;
+    }
+    this.startRound();
+  }
+
   private startRound() {
     const game = this.requiredGame();
     for (const player of game.players) game.discardPile.push(...player.cards);
     if (game.deck.length === 0) this.recycleDiscardPile();
-    if (game.deck.length === 0) game.deck = this.makeDeck(game.round + 1);
+    if (game.deck.length === 0) game.deck = this.makeDeck(game.round + 1, game.mode);
 
     game.phase = "playing";
     game.round += 1;
@@ -306,7 +370,7 @@ export class GameRoom extends DurableObject<WorkerEnv> {
       if (game.forcedDraw) {
         const forced = game.forcedDraw;
         const target = game.players.find((player) => player.id === forced.targetId);
-        if (!target || target.status !== "active") {
+        if (!target || target.status === "busted") {
           game.discardPile.push(...forced.deferredActions.map((action) => action.card));
           game.forcedDraw = null;
           continue;
@@ -315,13 +379,17 @@ export class GameRoom extends DurableObject<WorkerEnv> {
         this.drawOne(target, true);
         forced.remaining -= 1;
         if (game.phase !== "playing" || game.pendingAction) return;
-        if (target.status !== "active") {
+        if ((target as Player).status === "busted") {
           game.discardPile.push(...forced.deferredActions.map((action) => action.card));
           game.forcedDraw = null;
           continue;
         }
         if (forced.remaining > 0) continue;
 
+        if (forced.stayAfter) {
+          target.status = "stayed";
+          target.roundScore = this.score(target.cards);
+        }
         game.forcedDraw = null;
         game.actionQueue.unshift(...forced.deferredActions);
         continue;
@@ -329,12 +397,13 @@ export class GameRoom extends DurableObject<WorkerEnv> {
 
       if (game.actionQueue.length > 0) {
         const action = game.actionQueue.shift()!;
-        if (!game.players.some((player) => player.status === "active")) {
+        if (!game.players.some((player) => player.status !== "busted")) {
           game.discardPile.push(action.card);
           continue;
         }
         this.setPendingAction(action);
-        return;
+        if (game.pendingAction) return;
+        continue;
       }
 
       if (game.resumeFlow === "initial-deal") {
@@ -368,9 +437,13 @@ export class GameRoom extends DurableObject<WorkerEnv> {
     const card = this.takeCard();
 
     if (card.kind === "number") {
-      const duplicate = player.cards.some(
+      const sameNumbers = player.cards.filter(
         (held) => held.kind === "number" && held.value === card.value,
       );
+      const luckyThirteen = card.value === 13 && (
+        card.special === "lucky13" || sameNumbers.some((held) => held.kind === "number" && held.special === "lucky13")
+      );
+      const duplicate = sameNumbers.length > 0 && !(luckyThirteen && sameNumbers.length === 1);
       if (duplicate && player.hasSecondChance) {
         const chanceIndex = player.cards.findIndex((held) => held.kind === "secondChance");
         const [chance] = player.cards.splice(chanceIndex, 1);
@@ -382,6 +455,17 @@ export class GameRoom extends DurableObject<WorkerEnv> {
       }
 
       player.cards.push(card);
+      if (card.special === "unlucky7") {
+        const discarded = player.cards.filter(
+          (held) => held.id !== card.id && (held.kind === "number" || held.kind === "modifier"),
+        );
+        player.cards = player.cards.filter(
+          (held) => held.id === card.id || (held.kind !== "number" && held.kind !== "modifier"),
+        );
+        game.discardPile.push(...discarded);
+        game.message = `${player.name} found the Unlucky 7 and lost every other number and modifier.`;
+        return;
+      }
       if (duplicate) {
         player.status = "busted";
         player.roundScore = 0;
@@ -420,15 +504,15 @@ export class GameRoom extends DurableObject<WorkerEnv> {
         game.discardPile.push(card);
         game.message = `${player.name} discarded an extra Second Chance.`;
       } else {
-        this.setPendingAction({ kind: card.kind, ownerId: player.id, card });
+        this.setPendingAction({ kind: card.kind, ownerId: player.id, card, selections: [] });
       }
       return;
     }
 
-    const action = { kind: card.kind, ownerId: player.id, card } satisfies PendingAction;
+    const action = { kind: card.kind, ownerId: player.id, card, selections: [] } satisfies PendingAction;
     if (forced && game.forcedDraw) {
       game.forcedDraw.deferredActions.push(action);
-      game.message = `${player.name} revealed ${card.kind === "freeze" ? "Freeze" : "Flip Three"}. It resolves after the forced draws.`;
+      game.message = `${player.name} revealed ${this.cardLabel(card)}. It resolves after the forced draws.`;
     } else {
       this.setPendingAction(action);
     }
@@ -436,9 +520,24 @@ export class GameRoom extends DurableObject<WorkerEnv> {
 
   private setPendingAction(action: PendingAction) {
     const game = this.requiredGame();
+    const eligibleWithCards = game.players.filter(
+      (player) => player.status !== "busted" && player.cards.length > 0,
+    );
+    const hasTarget = action.kind === "steal"
+      ? eligibleWithCards.some((player) => player.id !== action.ownerId)
+      : action.kind === "swap"
+        ? eligibleWithCards.length >= 2
+        : action.kind === "discard"
+          ? eligibleWithCards.length >= 1
+          : true;
+    if (!hasTarget) {
+      game.discardPile.push(action.card);
+      game.message = `${this.cardLabel(action.card)} had no valid target and was discarded.`;
+      return;
+    }
     game.pendingAction = action;
     const owner = game.players.find((player) => player.id === action.ownerId);
-    const label = action.kind === "freeze" ? "Freeze" : action.kind === "flip3" ? "Flip Three" : "an extra Second Chance";
+    const label = this.cardLabel(action.card);
     game.message = `${owner?.name ?? "A player"} drew ${label}. Choose an eligible player.`;
   }
 
@@ -451,12 +550,10 @@ export class GameRoom extends DurableObject<WorkerEnv> {
 
     const owner = game.players.find((player) => player.id === playerId);
     const target = game.players.find((player) => player.id === targetId);
-    if (!owner || !target || target.status !== "active") {
-      throw new Error("Choose an active player.");
-    }
+    if (!owner || !target) throw new Error("Choose a player at the table.");
 
     if (pending.kind === "secondChance") {
-      if (target.id === owner.id || target.hasSecondChance) {
+      if (target.status !== "active" || target.id === owner.id || target.hasSecondChance) {
         throw new Error("Give the extra Second Chance to another active player who does not have one.");
       }
       game.pendingAction = null;
@@ -467,17 +564,148 @@ export class GameRoom extends DurableObject<WorkerEnv> {
       return;
     }
 
-    game.pendingAction = null;
-    game.discardPile.push(pending.card);
     if (pending.kind === "freeze") {
+      if (target.status !== "active") throw new Error("Choose an active player.");
+      game.pendingAction = null;
+      game.discardPile.push(pending.card);
       target.status = "frozen";
       target.roundScore = this.score(target.cards);
       game.message = `${owner.name} froze ${target.name} on ${target.roundScore} points.`;
-    } else {
-      game.forcedDraw = { targetId: target.id, remaining: 3, deferredActions: [] };
+    } else if (pending.kind === "flip3") {
+      if (target.status !== "active") throw new Error("Choose an active player.");
+      game.pendingAction = null;
+      game.discardPile.push(pending.card);
+      game.forcedDraw = { targetId: target.id, remaining: 3, deferredActions: [], stayAfter: false };
       game.message = `${owner.name} made ${target.name} flip three.`;
+    } else if (pending.kind === "modifier") {
+      if (target.status === "busted") throw new Error("Choose a player who has not busted.");
+      game.pendingAction = null;
+      target.cards.push(pending.card);
+      game.message = `${owner.name} gave ${target.name} ${this.cardLabel(pending.card)}.`;
+    } else if (pending.kind === "justOneMore" || pending.kind === "flip4") {
+      if (target.status === "busted") throw new Error("Choose a player who has not busted.");
+      game.pendingAction = null;
+      game.discardPile.push(pending.card);
+      game.forcedDraw = {
+        targetId: target.id,
+        remaining: pending.kind === "flip4" ? 4 : 1,
+        deferredActions: [],
+        stayAfter: pending.kind === "justOneMore",
+      };
+      game.message = pending.kind === "flip4"
+        ? `${owner.name} made ${target.name} flip four.`
+        : `${owner.name} gave ${target.name} Just One More.`;
+    } else {
+      throw new Error("Choose a face-up card for this action.");
     }
     this.continueFlow();
+  }
+
+  private selectPendingCard(playerId: string, targetPlayerId: string, cardId: string) {
+    const game = this.requiredGame();
+    const pending = game.pendingAction;
+    if (!pending || pending.ownerId !== playerId) {
+      throw new Error("You do not have an action card to resolve.");
+    }
+    if (!["steal", "swap", "discard"].includes(pending.kind)) {
+      throw new Error("Choose a player for this card.");
+    }
+
+    const owner = game.players.find((candidate) => candidate.id === playerId);
+    const target = game.players.find((candidate) => candidate.id === targetPlayerId);
+    const cardIndex = target?.cards.findIndex((card) => card.id === cardId) ?? -1;
+    if (!owner || !target || target.status === "busted" || cardIndex < 0) {
+      throw new Error("Choose a face-up card from a player who has not busted.");
+    }
+
+    if (pending.kind === "steal") {
+      if (target.id === owner.id) throw new Error("Steal a card from another player.");
+      const [stolen] = target.cards.splice(cardIndex, 1);
+      owner.cards.push(stolen);
+      game.pendingAction = null;
+      game.discardPile.push(pending.card);
+      this.resolveAcquiredCard(owner, stolen);
+      if (game.phase === "playing") game.message = `${owner.name} stole a card from ${target.name}.`;
+      if (game.phase === "playing") this.continueFlow();
+      return;
+    }
+
+    if (pending.kind === "discard") {
+      const [discarded] = target.cards.splice(cardIndex, 1);
+      game.pendingAction = null;
+      game.discardPile.push(pending.card, discarded);
+      game.message = `${owner.name} discarded one of ${target.name}'s cards.`;
+      this.resolveHandState(target);
+      this.continueFlow();
+      return;
+    }
+
+    const first = pending.selections[0];
+    if (!first) {
+      pending.selections = [{ playerId: target.id, cardId }];
+      game.message = `${owner.name} chose the first card. Choose a card from a different player.`;
+      return;
+    }
+    if (first.playerId === target.id) throw new Error("Swap cards belonging to two different players.");
+
+    const firstPlayer = game.players.find((candidate) => candidate.id === first.playerId);
+    const firstIndex = firstPlayer?.cards.findIndex((card) => card.id === first.cardId) ?? -1;
+    if (!firstPlayer || firstPlayer.status === "busted" || firstIndex < 0) {
+      pending.selections = [];
+      throw new Error("That first card is no longer available. Choose again.");
+    }
+
+    const firstCard = firstPlayer.cards[firstIndex];
+    const secondCard = target.cards[cardIndex];
+    firstPlayer.cards[firstIndex] = secondCard;
+    target.cards[cardIndex] = firstCard;
+    game.pendingAction = null;
+    game.discardPile.push(pending.card);
+    this.resolveAcquiredCard(firstPlayer, secondCard, false);
+    this.resolveAcquiredCard(target, firstCard, false);
+    if (game.phase === "playing") {
+      const flipSevenPlayer = [firstPlayer, target].find(
+        (player) => player.status !== "busted" && this.numberCardCount(player) >= 7,
+      );
+      if (flipSevenPlayer) this.endRound(flipSevenPlayer);
+    }
+    if (game.phase === "playing") game.message = `${owner.name} swapped cards between ${firstPlayer.name} and ${target.name}.`;
+    if (game.phase === "playing") this.continueFlow();
+  }
+
+  private resolveAcquiredCard(player: Player, acquired: Card, checkFlipSeven = true) {
+    const game = this.requiredGame();
+    if (acquired.kind === "number" && acquired.special === "unlucky7") {
+      const discarded = player.cards.filter(
+        (card) => card.id !== acquired.id && (card.kind === "number" || card.kind === "modifier"),
+      );
+      player.cards = player.cards.filter(
+        (card) => card.id === acquired.id || (card.kind !== "number" && card.kind !== "modifier"),
+      );
+      game.discardPile.push(...discarded);
+      return;
+    }
+
+    this.resolveHandState(player);
+    if (checkFlipSeven && game.phase === "playing" && player.status !== "busted" && this.numberCardCount(player) >= 7) {
+      this.endRound(player);
+    }
+  }
+
+  private resolveHandState(player: Player) {
+    const numbers = player.cards.filter((card) => card.kind === "number");
+    const counts = new Map<number, number>();
+    for (const card of numbers) counts.set(card.value, (counts.get(card.value) ?? 0) + 1);
+    const hasLuckyThirteen = numbers.some((card) => card.value === 13 && card.special === "lucky13");
+    const duplicate = [...counts].some(([value, count]) => count > (value === 13 && hasLuckyThirteen ? 2 : 1));
+    if (duplicate) {
+      player.status = "busted";
+      player.roundScore = 0;
+    }
+  }
+
+  private numberCardCount(player: Player) {
+    return player.cards.filter((card) => card.kind === "number").length;
   }
 
   private advanceTurn() {
@@ -525,7 +753,7 @@ export class GameRoom extends DurableObject<WorkerEnv> {
 
     const highestScore = Math.max(...game.players.map((player) => player.score));
     const leaders = game.players.filter((player) => player.score === highestScore);
-    if (highestScore >= 200 && leaders.length === 1) {
+    if (highestScore >= game.pointGoal && leaders.length === 1) {
       game.phase = "game-over";
       game.winnerId = leaders[0].id;
       game.message = `${leaders[0].name} wins with ${leaders[0].score} points!`;
@@ -535,7 +763,7 @@ export class GameRoom extends DurableObject<WorkerEnv> {
     game.phase = "round-over";
     if (flipSevenPlayer) {
       game.message = `${flipSevenPlayer.name} flipped seven unique numbers! Everyone banks their cards.`;
-    } else if (highestScore >= 200) {
+    } else if (highestScore >= game.pointGoal) {
       game.message = `The leaders are tied on ${highestScore}. Play another round to break the tie.`;
     } else {
       game.message = `Round ${game.round} is over. The host can deal the next round.`;
@@ -543,6 +771,7 @@ export class GameRoom extends DurableObject<WorkerEnv> {
   }
 
   private score(cards: Card[]) {
+    const game = this.requiredGame();
     const numberTotal = cards.reduce(
       (total, card) => total + (card.kind === "number" ? card.value : 0),
       0,
@@ -551,8 +780,18 @@ export class GameRoom extends DurableObject<WorkerEnv> {
       (total, card) => total + (card.kind === "bonus" ? card.value : 0),
       0,
     );
-    const doubled = cards.some((card) => card.kind === "double");
     const flipSevenBonus = cards.filter((card) => card.kind === "number").length >= 7 ? 15 : 0;
+    if (game.mode === "vengeance") {
+      const hasZero = cards.some((card) => card.kind === "number" && card.special === "zero");
+      const halved = cards.some((card) => card.kind === "modifier" && card.value === "half");
+      const penalty = cards.reduce(
+        (total, card) => total + (card.kind === "modifier" && card.value !== "half" ? Math.abs(card.value) : 0),
+        0,
+      );
+      const modified = Math.floor((hasZero ? 0 : numberTotal) / (halved ? 2 : 1)) - penalty;
+      return Math.max(0, modified) + flipSevenBonus;
+    }
+    const doubled = cards.some((card) => card.kind === "double");
     return numberTotal * (doubled ? 2 : 1) + bonusTotal + flipSevenBonus;
   }
 
@@ -570,7 +809,7 @@ export class GameRoom extends DurableObject<WorkerEnv> {
     game.discardPile = [];
   }
 
-  private makeDeck(round: number) {
+  private makeDeck(round: number, mode: GameMode) {
     const cards: Card[] = [];
     let serial = 0;
     const add = <T extends Omit<Card, "id">>(card: T, count = 1) => {
@@ -578,13 +817,32 @@ export class GameRoom extends DurableObject<WorkerEnv> {
         cards.push({ ...card, id: `${round}-${serial++}` } as Card);
       }
     };
-    add({ kind: "number", value: 0 }, 1);
-    for (let value = 1; value <= 12; value += 1) add({ kind: "number", value }, value);
-    for (const value of [2, 4, 6, 8, 10] as const) add({ kind: "bonus", value });
-    add({ kind: "double" }, 1);
-    add({ kind: "freeze" }, 3);
-    add({ kind: "flip3" }, 3);
-    add({ kind: "secondChance" }, 3);
+    if (mode === "vengeance") {
+      add({ kind: "number", value: 0, special: "zero" });
+      for (let value = 1; value <= 13; value += 1) {
+        if (value === 7) {
+          add({ kind: "number", value }, 6);
+          add({ kind: "number", value, special: "unlucky7" });
+        } else if (value === 13) {
+          add({ kind: "number", value }, 12);
+          add({ kind: "number", value, special: "lucky13" });
+        } else {
+          add({ kind: "number", value }, value);
+        }
+      }
+      for (const value of ["half", -2, -4, -6, -8, -10] as const) add({ kind: "modifier", value });
+      for (const kind of ["justOneMore", "flip4", "steal", "swap", "discard"] as const) {
+        add({ kind }, 2);
+      }
+    } else {
+      add({ kind: "number", value: 0 }, 1);
+      for (let value = 1; value <= 12; value += 1) add({ kind: "number", value }, value);
+      for (const value of [2, 4, 6, 8, 10] as const) add({ kind: "bonus", value });
+      add({ kind: "double" }, 1);
+      add({ kind: "freeze" }, 3);
+      add({ kind: "flip3" }, 3);
+      add({ kind: "secondChance" }, 3);
+    }
     return this.shuffle(cards);
   }
 
@@ -625,6 +883,8 @@ export class GameRoom extends DurableObject<WorkerEnv> {
     const connectedIds = new Set([...this.sockets.values()].map((value) => value.playerId));
     return {
       id: game.id,
+      mode: game.mode,
+      pointGoal: game.pointGoal,
       phase: game.phase,
       players: game.players.map(({ token: _token, ...player }) => ({
         ...player,
@@ -634,6 +894,7 @@ export class GameRoom extends DurableObject<WorkerEnv> {
       currentPlayerId: game.currentPlayerId,
       pendingAction: game.pendingAction?.kind ?? null,
       pendingActionPlayerId: game.pendingAction?.ownerId ?? null,
+      pendingCardSelections: game.pendingAction?.selections ?? [],
       dealerId: game.players[game.dealerIndex]?.id ?? null,
       round: game.round,
       winnerId: game.winnerId,
@@ -644,6 +905,25 @@ export class GameRoom extends DurableObject<WorkerEnv> {
   private requiredGame() {
     if (!this.game) throw new Error("Game not found.");
     return this.game;
+  }
+
+  private hasSpecial(player: Player, special: "zero" | "unlucky7" | "lucky13") {
+    return player.cards.some((card) => card.kind === "number" && card.special === special);
+  }
+
+  private cardLabel(card: PendingCard) {
+    if (card.kind === "modifier") return card.value === "half" ? "÷2" : `${card.value}`;
+    const labels: Record<ActionCard["kind"], string> = {
+      freeze: "Freeze",
+      flip3: "Flip Three",
+      secondChance: "an extra Second Chance",
+      justOneMore: "Just One More",
+      flip4: "Flip Four",
+      steal: "Steal",
+      swap: "Swap",
+      discard: "Discard",
+    };
+    return labels[card.kind];
   }
 
   private async save() {
