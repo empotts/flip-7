@@ -2,7 +2,7 @@
 
 A realtime, mobile-first push-your-luck card game inspired by Flip 7. Create a table, share its link, and race friends to 200 points without flipping the same number twice.
 
-**Live game:** [Play Lucky Seven](https://flipseven-flipseven-dev-ethanpotts-rr2xoild6whe44tl.ethanmpotts.workers.dev)
+**Live game:** [Play Lucky Seven](https://flip-7.ethanmpotts.workers.dev)
 
 ## Stack
 
@@ -45,6 +45,8 @@ pnpm alchemy deploy --yes
 ```
 
 The stack in [`alchemy.run.ts`](./alchemy.run.ts) deploys the frontend Worker, backend Worker, service binding, and Durable Object namespace together.
+
+Worker names are pinned to `flip-7` and `flip-7-api` so redeployments keep the same URLs. Deployment state is stored locally in `.alchemy/state`; preserve that directory between deploys. These fixed names share one deployment across stages.
 
 ## Game flow
 

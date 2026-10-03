@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import type { GameRoom } from "./src/worker.ts";
 
 export class Backend extends Cloudflare.Worker<Backend>()("FlipSevenApi", {
+  name: "flip-7-api",
   main: "./src/worker.ts",
   env: {
     GAMES: Cloudflare.DurableObject<GameRoom>("GameRoom"),
@@ -14,6 +15,7 @@ export class Backend extends Cloudflare.Worker<Backend>()("FlipSevenApi", {
 }) {}
 
 export class Website extends Cloudflare.Website.Vite<Website>()("FlipSeven", {
+  name: "flip-7",
   compatibility: {
     flags: ["nodejs_compat"],
   },
@@ -28,7 +30,7 @@ export default Alchemy.Stack(
   "FlipSeven",
   {
     providers: Cloudflare.providers(),
-    state: Cloudflare.state(),
+    state: Alchemy.localState(),
   },
   Effect.gen(function* () {
     const backend = yield* Backend;
